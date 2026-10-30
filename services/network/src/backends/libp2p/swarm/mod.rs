@@ -303,7 +303,19 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                             target: LOG_TARGET,
                             "Failed to connect to peer: {peer_id:?} {connection_id:?} due to: {error}"
                         );
-                        self.retry_connect(connection_id, peer_id);
+                        // Remove the failed addresses from Kademlia first, and then retry.
+                        // The retry is still possible because the dial holds its address.
+                        if let DialError::Transport(errors) = &error
+                            && let Some(peer_id) = peer_id
+                            && !self.swarm.swarm().is_connected(&peer_id)
+                        {
+                            for (addr, _) in errors {
+                                if self.swarm.kademlia_contains_address(peer_id, addr) {
+                                    self.remove_kademlia_address_for_dial(Some(peer_id), addr);
+                                }
+                            }
+                        }
+                        self.retry_connect(connection_id);
                     }
                 }
             }
@@ -559,7 +571,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
     }
 
     // TODO: Consider a common retry module for all use cases
-    fn retry_connect(&mut self, connection_id: ConnectionId, peer_id: Option<PeerId>) -> bool {
+    fn retry_connect(&mut self, connection_id: ConnectionId) -> bool {
         let Some(mut dial) = self.pending_dials.remove(&connection_id) else {
             return false;
         };
@@ -572,7 +584,6 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                 target: LOG_TARGET,
                 "Max retry({MAX_RETRY}) has been reached: {dial:?}"
             );
-            self.remove_kademlia_address_for_dial(peer_id, &dial.addr);
             return false;
         }
         dial.retry_count = new_retry_count;
@@ -598,6 +609,7 @@ mod tests {
     use std::{net::Ipv4Addr, num::NonZero, sync::Once, time::Instant};
 
     use lb_core::header::HeaderId;
+    use lb_libp2p::libp2p::TransportError;
     use lb_time::era::{EraEntriesAfterGenesis, EraSchedule, EraTiming};
     use rand::rngs::OsRng;
     use testing_framework_tools::net::get_available_udp_port;
@@ -1448,32 +1460,9 @@ mod tests {
             "Expected Kademlia to contain the remote address before failure handling",
         );
 
-        let (result_sender, _result_rx) = oneshot::channel();
-        handler.connect(Dial {
-            addr: remote_addr.clone(),
-            retry_count: 0,
-            result_sender,
-        });
-
-        let connection_id = *handler
-            .pending_dials
-            .keys()
-            .next()
-            .expect("Expected a pending dial entry");
-
-        handler
-            .pending_dials
-            .get_mut(&connection_id)
-            .expect("pending dial entry should exist")
-            .retry_count = MAX_RETRY;
-
-        let event = SwarmEvent::OutgoingConnectionError {
-            peer_id: Some(remote_peer),
-            connection_id,
-            error: DialError::NoAddresses,
-        };
-
-        handler.handle_swarm_event(event);
+        // A single failed dial removes the address, even though it is the last
+        // address of the peer, and no matter which behaviour made the dial.
+        handler.handle_swarm_event(failed_dial_event(remote_peer, &remote_addr));
 
         let after = handler.swarm.kademlia_discovered_peers();
         assert!(
@@ -1638,5 +1627,17 @@ mod tests {
 
         assert_eq!(info.discovered_peers, []);
         assert_eq!(info.n_discovered_peers, 0);
+    }
+
+    /// A failed dial to `addr` of `peer_id` that was not made by this service.
+    fn failed_dial_event(peer_id: PeerId, addr: &Multiaddr) -> SwarmEvent<BehaviourEvent<OsRng>> {
+        SwarmEvent::OutgoingConnectionError {
+            peer_id: Some(peer_id),
+            connection_id: ConnectionId::new_unchecked(0),
+            error: DialError::Transport(vec![(
+                addr.clone(),
+                TransportError::Other(std::io::Error::other("unreachable")),
+            )]),
+        }
     }
 }
