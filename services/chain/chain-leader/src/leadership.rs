@@ -261,7 +261,7 @@ pub enum BuildProofError {
 /// per slot; the Blend winning-slot scan does not, since the leadership quota
 /// proof only attests that a note was aged, not that it is unspent.
 pub struct SlotContext {
-    /// Tip explicitly passed to `get_leader_aged_notes` for the wallet query.
+    /// Tip passed as `base` to `get_leader_aged_notes` for the wallet query.
     pub wallet_tip: HeaderId,
     pub epoch_state: EpochState,
     pub eligible_aged: Vec<UtxoWithKeyId>,
@@ -344,7 +344,7 @@ pub async fn search_for_winning_slots<CryptarchiaService, Wallet, RuntimeService
             eligible_aged,
             source,
         } = slot_context;
-        tracing::info!(
+        tracing::debug!(
             target: LOG_TARGET,
             event = "leader_eligible_notes",
             path = "winning_slot_scan",
@@ -460,7 +460,7 @@ where
     // the one of the tip's epoch: on the first slots of an epoch, before any
     // block of it is on the chain, the two differ.
     let eligible_utxos = wallet_api
-        .get_leader_aged_notes(Some(wallet_tip), epoch_state.utxos.clone())
+        .get_leader_aged_notes(wallet_tip, epoch_state.utxos.clone())
         .await
         .ok()?;
     let eligible = eligible_utxos
