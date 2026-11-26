@@ -37,11 +37,12 @@ use tracing::{debug, error, info, instrument, trace, warn};
 use crate::{
     AppliedBlock, BlendDeclarationStatus, BlendRewards, BlendStatus, BlockWithVerifiedHeader,
     ChainServiceInfo, ConsensusMsg, Cryptarchia, EpochStateQueryResult, Error, LOG_TARGET,
-    LibUpdate, ProcessedBlockEvent, PrunedBlocksInfo, Query, metrics,
+    LibUpdate, ProcessedBlockEvent, PrunedBlocksInfo, Query, TryApplyBlockOutcome, metrics,
     notifier::ChainOnlineNotifier,
     relays::{BroadcastRelay, CryptarchiaConsensusRelays},
     states::RecoveryRecorder,
     sync::block_provider::BlockProvider,
+    verified::StoredBlock,
 };
 
 pub struct ProcessBlockOutcome<Tx> {
@@ -1006,12 +1007,111 @@ where
         + 'static,
 {
     debug!(target: LOG_TARGET, "Received proposal with ID: {:?}", block.header().id());
-    let header = block.header().clone();
     let prev_lib = cryptarchia.lib();
 
     let mut candidate = cryptarchia.clone();
     let applied = candidate.try_apply_block_with_state_retention(&block)?;
-    let block = Block::from(block);
+
+    process_applied_block(
+        cryptarchia,
+        candidate,
+        prev_lib,
+        applied,
+        Block::from(block),
+        relays,
+        new_block_subscription_sender,
+        lib_broadcaster,
+        recovery,
+    )
+    .await
+}
+
+/// Try to add a [`StoredBlock`] to [`Cryptarchia`], as [`process_block`]
+/// does, but without verifying its deferred proofs again.
+///
+/// A [`StoredBlock`] is only added if it passes the stateful checks.
+/// Otherwise, the [`Cryptarchia`] is unchanged and an error is returned.
+#[expect(clippy::allow_attributes_without_reason)]
+#[instrument(
+    target = LOG_TARGET,
+    level = "debug",
+    skip(cryptarchia, block, relays, new_block_subscription_sender, lib_broadcaster),
+    fields(block_id = %block.header().id(), tx_count = block.transactions_iter().count())
+)]
+pub async fn process_stored_block<Tx>(
+    cryptarchia: &mut Cryptarchia,
+    block: StoredBlock<Tx>,
+    relays: &CryptarchiaConsensusRelays<Tx>,
+    new_block_subscription_sender: &broadcast::Sender<ProcessedBlockEvent>,
+    lib_broadcaster: &broadcast::Sender<LibUpdate>,
+) -> Result<ProcessBlockOutcome<Tx>, Error>
+where
+    Tx: PreverifiedMantleTransaction
+        + SignedMantleTx<Preverified, StandardMode>
+        + StorageSize
+        + Debug
+        + Clone
+        + Eq
+        + Serialize
+        + DeserializeOwned
+        + BinaryEncode
+        + BinaryDecode<Context = u32>
+        + Send
+        + Sync
+        + Unpin
+        + 'static,
+{
+    debug!(target: LOG_TARGET, "Replaying stored block with ID: {:?}", block.header().id());
+    let prev_lib = cryptarchia.lib();
+
+    let mut candidate = cryptarchia.clone();
+    let applied = candidate.try_apply_stored_block_with_state_retention(&block)?;
+
+    process_applied_block(
+        cryptarchia,
+        candidate,
+        prev_lib,
+        applied,
+        Block::from(block),
+        relays,
+        new_block_subscription_sender,
+        lib_broadcaster,
+        None,
+    )
+    .await
+}
+
+/// Stores `block` that was applied to `candidate`, and replaces
+/// `cryptarchia` with `candidate` once the block is stored.
+#[expect(clippy::too_many_arguments, reason = "Need all args")]
+async fn process_applied_block<Tx>(
+    cryptarchia: &mut Cryptarchia,
+    mut candidate: Cryptarchia,
+    prev_lib: HeaderId,
+    applied: TryApplyBlockOutcome,
+    block: Block<Tx>,
+    relays: &CryptarchiaConsensusRelays<Tx>,
+    new_block_subscription_sender: &broadcast::Sender<ProcessedBlockEvent>,
+    lib_broadcaster: &broadcast::Sender<LibUpdate>,
+    recovery: Option<(&mut RecoveryRecorder, &HashSet<HeaderId>)>,
+) -> Result<ProcessBlockOutcome<Tx>, Error>
+where
+    Tx: PreverifiedMantleTransaction
+        + SignedMantleTx<Preverified, StandardMode>
+        + StorageSize
+        + Debug
+        + Clone
+        + Eq
+        + Serialize
+        + DeserializeOwned
+        + BinaryEncode
+        + BinaryDecode<Context = u32>
+        + Send
+        + Sync
+        + Unpin
+        + 'static,
+{
+    let header = block.header().clone();
     let new_lib = candidate.lib();
 
     let tx_count = block.transactions_iter().count();

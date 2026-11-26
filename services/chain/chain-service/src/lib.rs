@@ -35,7 +35,6 @@ use lb_core::{
         traits::{PreverifiedMantleTransaction, SignedMantleTx, StorageSize},
         transactions::states::Preverified,
     },
-    proofs::leader_proof::LeaderProof as _,
     sdp::{Declaration, DeclarationId},
 };
 use lb_cryptarchia_engine::{Branch, EraSchedule, PrunedBlocks, ReorgedBlocks, UncleSlots};
@@ -80,10 +79,12 @@ use crate::{
     notifier::ChainOnlineNotifier,
     relays::CryptarchiaConsensusRelays,
     service::{
-        Service, delete_stale_blocks_from_storage, load_block_ids_from_storage, process_block,
+        Service, delete_stale_blocks_from_storage, load_block_ids_from_storage,
+        process_stored_block,
     },
     states::{RecoveryProgress, RecoveryRecorder},
     sync::block_provider::BlockProvider,
+    verified::StoredBlock,
 };
 
 // Limit the number of blocks returned by GetHeaders
@@ -146,7 +147,7 @@ struct InitializedCryptarchia {
 }
 
 struct RecoveryBlocks<Tx> {
-    blocks: Vec<BlockWithVerifiedHeader<Tx>>,
+    blocks: Vec<StoredBlock<Tx>>,
     fell_back_to_lib: bool,
 }
 
@@ -590,6 +591,8 @@ impl Cryptarchia {
 
     /// Apply a block while retaining pruned ledger states until the caller has
     /// observed any canonical transition represented by the result.
+    ///
+    /// The deferred proofs of the block are batch-verified.
     pub(crate) fn try_apply_block_with_state_retention<Tx>(
         &mut self,
         block: &BlockWithVerifiedHeader<Tx>,
@@ -598,44 +601,75 @@ impl Cryptarchia {
         Tx: PreverifiedMantleTransaction + StorageSize + Clone,
     {
         let header = block.header();
-        let id = header.id();
-        let parent = header.parent();
-        let slot = header.slot();
-
-        if self.ledger.state(&id).is_some() {
-            return Err(Error::AlreadyApplied(id));
-        }
-
-        let block_uncle_headers_slots = block.uncle_headers().slots();
-        let leader_proof = header.leader_proof();
+        self.ensure_not_applied(header)?;
 
         // Apply the block to the ledger, and batch-verify ZK proofs.
         // This ledger update is not finalized yet, and will be committed only
         // after checking if the block is accepted by the consensus
         // engine.
-        let update = self
-            .ledger
-            .prepare_update(
-                id,
-                parent,
-                slot,
-                &leader_proof.entropy(),
-                *leader_proof.voucher_cm(),
-                &block_uncle_headers_slots,
-                block.transactions_iter().cloned(),
-            )
-            .map_err(|err| match err {
-                lb_ledger::LedgerError::ParentNotFound(parent) => Error::ParentMissing {
-                    parent,
-                    info: Box::new(self.info()),
-                },
-                err => Error::Ledger(err),
-            })?
+        let update = block
+            .prepare_update(&self.ledger)
+            .map_err(|err| self.map_ledger_error(err))?
             .verify_batch_proofs()?;
 
+        self.receive_and_commit_update(header, block.uncle_headers(), update)
+    }
+
+    /// Apply a block read from storage while retaining pruned ledger states
+    /// until the caller has observed any canonical transition represented by
+    /// the result.
+    ///
+    /// The stateful checks of the block's transactions run as for any other
+    /// block, but its deferred proofs are not verified again, since this node
+    /// verified them before storing the block.
+    pub(crate) fn try_apply_stored_block_with_state_retention<Tx>(
+        &mut self,
+        block: &StoredBlock<Tx>,
+    ) -> Result<TryApplyBlockOutcome, Error>
+    where
+        Tx: PreverifiedMantleTransaction + StorageSize + Clone,
+    {
+        let header = block.header();
+        self.ensure_not_applied(header)?;
+
+        let update = block
+            .prepare_update(&self.ledger)
+            .map_err(|err| self.map_ledger_error(err))?;
+
+        self.receive_and_commit_update(header, block.uncle_headers(), update)
+    }
+
+    fn ensure_not_applied(&self, header: &Header) -> Result<(), Error> {
+        let id = header.id();
+        if self.ledger.state(&id).is_some() {
+            return Err(Error::AlreadyApplied(id));
+        }
+        Ok(())
+    }
+
+    fn map_ledger_error(&self, err: lb_ledger::LedgerError<HeaderId>) -> Error {
+        match err {
+            lb_ledger::LedgerError::ParentNotFound(parent) => Error::ParentMissing {
+                parent,
+                info: Box::new(self.info()),
+            },
+            err => Error::Ledger(err),
+        }
+    }
+
+    /// Passes the block to the consensus engine, and commits its ledger
+    /// `update` if the engine accepts the block.
+    fn receive_and_commit_update(
+        &mut self,
+        header: &Header,
+        uncle_headers: &UncleHeaders,
+        update: lb_ledger::VerifiedUpdate<HeaderId>,
+    ) -> Result<TryApplyBlockOutcome, Error> {
+        let id = header.id();
+        let parent = header.parent();
         let outcome = self
             .consensus
-            .receive_block_with_canonical_change(id, parent, slot, block_uncle_headers_slots)
+            .receive_block_with_canonical_change(id, parent, header.slot(), uncle_headers.slots())
             .map_err(|err| match err {
                 lb_cryptarchia_engine::Error::ParentMissing(parent) => Error::ParentMissing {
                     parent,
@@ -1024,7 +1058,7 @@ where
         tip: HeaderId,
         lib: HeaderId,
         storage: StorageApi<Tx>,
-    ) -> Result<Vec<BlockWithVerifiedHeader<Tx>>, Error> {
+    ) -> Result<Vec<StoredBlock<Tx>>, Error> {
         let ids = load_block_ids_from_storage(tip, lib, storage.clone())
             .try_collect::<Vec<_>>()
             .await?;
@@ -1034,7 +1068,7 @@ where
         // LIB. Replay recovery blocks in LIB->tip order, skipping LIB
         // because Cryptarchia is already initialized from it.
         for id in ids.into_iter().rev().skip(1) {
-            let block = BlockWithVerifiedHeader::load_stored(&storage, &id)
+            let block = StoredBlock::load(&storage, &id)
                 .await
                 .ok_or(Error::HeaderIdNotFound(id))?;
             blocks.push(block);
@@ -1178,13 +1212,12 @@ where
         let n_blocks = blocks.len();
         for (i, block) in blocks.into_iter().enumerate() {
             let block_id = block.header().id();
-            let outcome = process_block(
+            let outcome = process_stored_block(
                 &mut cryptarchia,
                 block,
                 relays,
                 new_block_subscription_sender,
                 lib_subscription_sender,
-                None,
             )
             .await
             .inspect_err(|error| {
@@ -1240,8 +1273,7 @@ where
         let mut parent = checkpoint_lib;
         let mut slot = checkpoint_branch.slot();
         for id in ids.into_iter().rev().skip(1) {
-            let block = storage
-                .try_get_block(&id)
+            let block = StoredBlock::try_load(storage, &id)
                 .await
                 .map_err(|error| {
                     Error::Storage(format!("Failed to load finalized block {id}: {error}"))
@@ -1256,20 +1288,10 @@ where
             }
 
             slot = header.slot();
-            let leader_proof = header.leader_proof();
             let uncle_slots = block.uncle_headers().slots();
-            let update = cryptarchia
-                .ledger
-                .prepare_update(
-                    id,
-                    parent,
-                    slot,
-                    &leader_proof.entropy(),
-                    *leader_proof.voucher_cm(),
-                    &uncle_slots,
-                    block.transactions_iter().cloned(),
-                )?
-                .verify_batch_proofs()?;
+            // This node verified the proofs of the block before storing it,
+            // so only the stateful checks run here.
+            let update = block.prepare_update(&cryptarchia.ledger)?;
 
             cryptarchia.ledger.commit_update(update);
             cryptarchia.ledger.prune_state_at(&parent);

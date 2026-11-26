@@ -6,14 +6,15 @@ use lb_core::{
     header::{Header, HeaderId},
     mantle::{
         TxHash,
-        traits::{Hashable, StorageSize},
+        traits::{Hashable, PreverifiedMantleTransaction, StorageSize},
     },
     proofs::leader_proof::LeaderProof as _,
 };
 use lb_cryptarchia_engine::Slot;
 use lb_key_management_system_keys::keys::Ed25519Signature;
-use lb_ledger::LedgerError;
+use lb_ledger::{Ledger, LedgerError, PreparedUpdate, VerifiedUpdate};
 use lb_storage_service::api::StorageApi;
+use overwatch::DynError;
 
 use crate::{Cryptarchia, Error};
 
@@ -135,20 +136,94 @@ impl<Tx> BlockWithVerifiedHeader<Tx> {
         )))
     }
 
-    /// Reads the block `id` from `storage`, without verifying it, since this
-    /// node verified the block before storing it.
-    pub(crate) async fn load_stored(storage: &StorageApi<Tx>, id: &HeaderId) -> Option<Self>
+    #[must_use]
+    pub const fn header(&self) -> &Header {
+        self.0.header()
+    }
+
+    #[must_use]
+    pub const fn uncle_headers(&self) -> &UncleHeaders {
+        self.0.uncle_headers()
+    }
+
+    pub fn transactions_iter(&self) -> impl ExactSizeIterator<Item = &Tx> + '_ {
+        self.0.transactions_iter()
+    }
+
+    /// Applies the block on top of its parent state in `ledger`, running the
+    /// stateful checks of every operation. The deferred proofs are returned
+    /// in the [`PreparedUpdate`], to be verified or trusted by the caller.
+    pub(crate) fn prepare_update(
+        &self,
+        ledger: &Ledger<HeaderId>,
+    ) -> Result<PreparedUpdate<HeaderId>, LedgerError<HeaderId>>
+    where
+        Tx: PreverifiedMantleTransaction + StorageSize + Clone,
+    {
+        let header = self.header();
+        let leader_proof = header.leader_proof();
+        ledger.prepare_update(
+            header.id(),
+            header.parent(),
+            header.slot(),
+            &leader_proof.entropy(),
+            *leader_proof.voucher_cm(),
+            &self.uncle_headers().slots(),
+            self.transactions_iter().cloned(),
+        )
+    }
+}
+
+impl<Tx> From<BlockWithVerifiedHeader<Tx>> for Block<Tx> {
+    fn from(block: BlockWithVerifiedHeader<Tx>) -> Self {
+        block.0
+    }
+}
+
+/// A [`Block`] read from the storage of this node.
+///
+/// This node fully verified the block before storing it: the header, the
+/// transactions, and all their proofs. So its header is taken as verified, and
+/// its deferred proofs are not verified again when it is applied. The stateful
+/// checks of its transactions still run while it is applied.
+///
+/// It can be created only by reading the block from storage. A block received
+/// from a peer must never become a [`StoredBlock`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredBlock<Tx>(BlockWithVerifiedHeader<Tx>);
+
+impl<Tx> StoredBlock<Tx> {
+    /// Reads the block `id` from `storage`, without verifying it.
+    pub(crate) async fn load(storage: &StorageApi<Tx>, id: &HeaderId) -> Option<Self>
     where
         Tx: BinaryDecode<Context = u32> + Hashable<Hash = TxHash> + StorageSize,
     {
-        storage.get_block(id).await.map(Self)
+        storage
+            .get_block(id)
+            .await
+            .map(|block| Self(BlockWithVerifiedHeader(block)))
     }
 
-    /// Takes `block` as verified without verifying it, for tests that need a
-    /// [`BlockWithVerifiedHeader`] regardless of the chain.
+    /// Reads the block `id` from `storage`, without verifying it, and returns
+    /// the storage error if the read fails.
+    pub(crate) async fn try_load(
+        storage: &StorageApi<Tx>,
+        id: &HeaderId,
+    ) -> Result<Option<Self>, DynError>
+    where
+        Tx: BinaryDecode<Context = u32> + Hashable<Hash = TxHash> + StorageSize,
+    {
+        Ok(storage
+            .try_get_block(id)
+            .await?
+            .map(|block| Self(BlockWithVerifiedHeader(block))))
+    }
+
+    /// Takes `block` as stored without reading it from storage, for tests
+    /// that need a [`StoredBlock`] regardless of the storage.
     #[cfg(test)]
     pub(crate) const fn new_unchecked(block: Block<Tx>) -> Self {
-        Self(block)
+        Self(BlockWithVerifiedHeader(block))
     }
 
     #[must_use]
@@ -164,10 +239,35 @@ impl<Tx> BlockWithVerifiedHeader<Tx> {
     pub fn transactions_iter(&self) -> impl ExactSizeIterator<Item = &Tx> + '_ {
         self.0.transactions_iter()
     }
+
+    /// Applies the block on top of its parent state in `ledger`, and returns
+    /// the update to commit.
+    ///
+    /// The stateful checks of every operation run as for any other block.
+    /// Only the deferred proofs are not verified again.
+    ///
+    /// This is the only place that calls
+    /// [`PreparedUpdate::trust_batch_proofs`](lb_ledger::PreparedUpdate::trust_batch_proofs),
+    /// so that only a block read from storage can skip its deferred proofs.
+    pub(crate) fn prepare_update(
+        &self,
+        ledger: &Ledger<HeaderId>,
+    ) -> Result<VerifiedUpdate<HeaderId>, LedgerError<HeaderId>>
+    where
+        Tx: PreverifiedMantleTransaction + StorageSize + Clone,
+    {
+        let update = self.0.prepare_update(ledger)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This node verified the proofs of a stored block before storing it."
+        )]
+        let update = update.trust_batch_proofs();
+        Ok(update)
+    }
 }
 
-impl<Tx> From<BlockWithVerifiedHeader<Tx>> for Block<Tx> {
-    fn from(block: BlockWithVerifiedHeader<Tx>) -> Self {
-        block.0
+impl<Tx> From<StoredBlock<Tx>> for Block<Tx> {
+    fn from(block: StoredBlock<Tx>) -> Self {
+        block.0.into()
     }
 }

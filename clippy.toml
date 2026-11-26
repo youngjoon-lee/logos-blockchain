@@ -1,0 +1,6 @@
+# A block received from a peer must have its deferred proofs verified.
+# Only `StoredBlock::prepare_update` in chain-service may skip them,
+# since this node verified the proofs of a stored block before storing it.
+[[disallowed-methods]]
+path   = "logos_blockchain_ledger::update::PreparedUpdate::trust_batch_proofs"
+reason = "only for blocks this node verified before storing them: use `StoredBlock::prepare_update`"
